@@ -5,9 +5,12 @@ from pathlib import Path
 
 
 def setup(path: Path):
+    print("hello")
     config = toml.load(path.joinpath('plugin_info.toml'))
+    print(config)
     SHORT_PLUGIN_NAME = config['plugin-info']['SHORT_PLUGIN_NAME']
     PLUGIN_NAME = f"pymodaq_plugins_{SHORT_PLUGIN_NAME}"
+    print(SHORT_PLUGIN_NAME, PLUGIN_NAME)
 
     if not SHORT_PLUGIN_NAME.isidentifier():
         raise ValueError("'SHORT_PLUGIN_NAME = %s' is not a valid python identifier." % SHORT_PLUGIN_NAME)
@@ -15,10 +18,11 @@ def setup(path: Path):
     with open(str(path.joinpath(f'src/{PLUGIN_NAME}/resources/VERSION')), 'r') as fvers:
         version = fvers.read().strip()
 
-
+    print("hi again")
     with open(path.joinpath('README.rst')) as fd:
         long_description = fd.read()
 
+    print("hey sexy")
     setupOpts = dict(
         name=PLUGIN_NAME,
         description=config['plugin-info']['description'],
@@ -40,8 +44,10 @@ def setup(path: Path):
             "Topic :: Software Development :: Libraries :: Python Modules",
             "Topic :: Software Development :: User Interfaces",
         ], )
+    
+    print(setupOpts)
 
-
+    print("next ya hoe")
     entrypoints = {}
     if 'features' in config:
         if config['features'].get('instruments', False):
@@ -61,6 +67,7 @@ def setup(path: Path):
 
     entrypoints['pymodaq.plugins'] = f'{SHORT_PLUGIN_NAME} = {PLUGIN_NAME}'  # generic plugin, usefull for the plugin manager
 
+    print(entrypoints)
     realsetup(
         version=version,
         packages=find_packages(where='./src'),
@@ -70,4 +77,5 @@ def setup(path: Path):
         install_requires=['toml', ]+config['plugin-install']['packages-required'],
         **setupOpts
     )
+    print("maybe ?")
 

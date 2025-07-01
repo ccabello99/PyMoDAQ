@@ -8,7 +8,7 @@ import logging
 from pathlib import Path
 from importlib import import_module
 from packaging import version as version_mod
-from typing import Tuple, List, Any, TYPE_CHECKING
+from typing import Tuple, List, Any, TYPE_CHECKING, Sequence
 
 
 from qtpy import QtGui, QtWidgets, QtCore
@@ -46,7 +46,6 @@ from pymodaq.utils import config as config_mod_pymodaq
 from pymodaq.control_modules.daq_move import DAQ_Move
 from pymodaq.control_modules.daq_viewer import DAQ_Viewer
 from pymodaq_gui.utils.splash import get_splash_sc
-
 from pymodaq import extensions as extmod
 
 logger = set_logger(get_module_name(__file__))
@@ -72,6 +71,7 @@ class ManagerEnums(BaseEnum):
     overshoot = 2
     roi = 3
 
+
 class PymodaqUpdateTableWidget(QTableWidget):
     '''
         A class to represent PyMoDAQ and its subpackages'
@@ -79,19 +79,43 @@ class PymodaqUpdateTableWidget(QTableWidget):
     '''
     def __init__(self):
         super().__init__()
-        self._row = 0
+
+        self._checkboxes = []
+        self._package_versions = []
 
     def setHorizontalHeaderLabels(self, labels):
         super().setHorizontalHeaderLabels(labels)
         self.setColumnCount(len(labels))
         
-    def append_row(self, package, current_version, available_version):
-        # Add labels
-        self.setItem(self._row, 0, QTableWidgetItem(str(package)))
-        self.setItem(self._row, 1, QTableWidgetItem(str(current_version)))
-        self.setItem(self._row, 2, QTableWidgetItem(str(available_version)))
+    def append_row(self, checkbox, package, current_version, available_version):  
+        row = len(self._checkboxes)
 
-        self._row += 1
+        self._checkboxes.append(checkbox)
+        self._package_versions.append(f'{package}=={available_version}')
+
+        checkbox_widget = QWidget()
+                        
+        checkbox.setChecked(True)
+        checkbox.setToolTip("Check to install update")
+
+        checkbox_layout = QtWidgets.QHBoxLayout()                
+        checkbox_layout.addWidget(checkbox)
+        checkbox_layout.setAlignment(Qt.AlignCenter)
+        checkbox_layout.setContentsMargins(0, 0, 0, 0)
+
+        checkbox_widget.setLayout(checkbox_layout)
+
+        # Add the checkbox widget to the table
+        self.setCellWidget(row, 0, checkbox_widget)
+
+        # Add labels in the other columns
+        self.setItem(row, 1, QTableWidgetItem(str(package)))
+        self.setItem(row, 2, QTableWidgetItem(str(current_version)))
+        self.setItem(row, 3, QTableWidgetItem(str(available_version)))
+
+    def get_checked_data(self):
+        checked = list(map(lambda c : c.isChecked(), self._checkboxes))
+        return list(np.array(self._package_versions)[checked])
 
     def sizeHint(self):
         self.resizeColumnsToContents()
@@ -107,6 +131,7 @@ class PymodaqUpdateTableWidget(QTableWidget):
         	   + sum([self.rowHeight(i) for i in range(self.rowCount())])
 
         return QSize(width, height)
+
 
 class DashBoard(CustomApp):
     """
@@ -311,8 +336,39 @@ class DashBoard(CustomApp):
         self.bayesian_window.setWindowTitle('Bayesian Optimiser')
         self.bayesian_module = extmod.BayesianOptimisation(dockarea=dockarea, dashboard=self)
         self.extensions['bayesian'] = self.bayesian_module
-        self.bayesian_window.show()
+
+        if self.bayesian_module.validate_config():
+            self.bayesian_window.show()
+        else:
+            messagebox(severity='critical', title="Bayesian Optimisation error",
+            text=f"""
+                <p>Saved Bayesian Optimisation configuration file is not compatible anymore.</p>
+                <p>Please delete the file at <b>{self.bayesian_module.config_path}</b>.</p>
+            """)
+            self.bayesian_module.quit()
         return self.bayesian_module
+
+    def load_adaptive(self, win=None):
+        if win is None:
+            self.adaptive_window = QtWidgets.QMainWindow()
+        else:
+            self.adaptive_window = win
+        dockarea = DockArea()
+        self.adaptive_window.setCentralWidget(dockarea)
+        self.adaptive_window.setWindowTitle('Adaptive Scan')
+        self.adaptive_module = extmod.AdaptiveOptimisation(dockarea=dockarea, dashboard=self)
+        self.extensions['adaptive'] = self.adaptive_module
+
+        if self.adaptive_module.validate_config():
+            self.adaptive_window.show()
+        else:
+            messagebox(severity='critical', title="Adaptive Optimisation error",
+                       text=f"""
+                    <p>Saved Adaptive Optimisation configuration file is not compatible anymore.</p>
+                    <p>Please delete the file at <b>{self.adaptive_module.config_path}</b>.</p>
+                """)
+            self.adaptive_module.quit()
+        return self.adaptive_module
 
     def load_extension_from_name(self, name: str) -> dict:
         return self.load_extensions_module(find_dict_in_list_from_key_val(extensions, 'name', name))
@@ -415,6 +471,7 @@ class DashBoard(CustomApp):
         self.add_action('do_pid', 'PID module', auto_toolbar=False)
         self.add_action('console', 'IPython Console', auto_toolbar=False)
         self.add_action('bayesian', 'Bayesian Optimisation', auto_toolbar=False)
+        self.add_action('adaptive', 'Adaptive Scan', auto_toolbar=False)
 
         self.add_action('about', 'About', 'information2')
         self.add_action('help', 'Help', 'help1')
@@ -492,6 +549,8 @@ class DashBoard(CustomApp):
         self.connect_action('do_pid', lambda: self.load_pid_module())
         self.connect_action('console', lambda: self.load_console())
         self.connect_action('bayesian', lambda: self.load_bayesian())
+        self.connect_action('adaptive', lambda: self.load_adaptive())
+
 
         self.connect_action('about', self.show_about)
         self.connect_action('help', self.show_help)
@@ -573,6 +632,7 @@ class DashBoard(CustomApp):
         self.extensions_menu.addAction(self.get_action('do_pid'))
         self.extensions_menu.addAction(self.get_action('console'))
         self.extensions_menu.addAction(self.get_action('bayesian'))
+        self.extensions_menu.addAction(self.get_action('adaptive'))
 
         # extensions from plugins
         extensions_actions = []
@@ -588,13 +648,15 @@ class DashBoard(CustomApp):
         help_menu.addAction(self.get_action('check_update'))
         help_menu.addAction(self.get_action('plugin_manager'))
 
-        self.overshoot_menu.setEnabled(False)
-        self.roi_menu.setEnabled(False)
-        self.remote_menu.setEnabled(False)
-        self.extensions_menu.setEnabled(False)
-        self.file_menu.setEnabled(True)
-        self.settings_menu.setEnabled(True)
-        self.preset_menu.setEnabled(True)
+        status = self.preset_file is None
+
+        self.overshoot_menu.setEnabled(not status)
+        self.roi_menu.setEnabled(not status)
+        self.remote_menu.setEnabled(not status)
+        self.extensions_menu.setEnabled(not status)
+        self.file_menu.setEnabled(status)
+        self.settings_menu.setEnabled(status)
+        self.preset_menu.setEnabled(status)
 
     def start_plugin_manager(self):
         self.win_plug_manager = QtWidgets.QMainWindow()
@@ -750,15 +812,9 @@ class DashBoard(CustomApp):
                 if hasattr(self.extensions[ext], 'quit_fun'):
                     self.extensions[ext].quit_fun()
             for mov in self.actuators_modules:
-                try:
-                    mov.init_signal.disconnect(self.update_init_tree)
-                except TypeError:
-                    pass
+                mov.init_signal.disconnect(self.update_init_tree)
             for det in self.detector_modules:
-                try:
-                    det.init_signal.disconnect(self.update_init_tree)
-                except TypeError:
-                    pass
+                det.init_signal.disconnect(self.update_init_tree)
 
             for module in self.actuators_modules:
                 try:
@@ -865,7 +921,7 @@ class DashBoard(CustomApp):
                 self.splash_sc.showMessage(mssg)
         QtWidgets.QApplication.processEvents()
 
-        mov_mod_tmp.bounds_signal[bool].connect(self.do_stuff_from_out_bounds)
+        mov_mod_tmp.bounds_signal[bool].connect(self.stop_moves)
         move_docks[-1].addWidget(move_forms[-1])
         actuators_modules.append(mov_mod_tmp)
         return mov_mod_tmp
@@ -936,13 +992,33 @@ class DashBoard(CustomApp):
         detector_modules.append(det_mod_tmp)
         return det_mod_tmp
 
+    def override_det_from_extension(self, overriden_grabbers: Sequence[str] = None):
+        """ (Experimental) If an extension adding detectors within the Dashboard need to, it could call this
+        method.
+
+        Then if some other extension trigger a grab from it, the request of a grab won't be done twice
+
+        Parameters
+        ----------
+        overriden_grabbers: Sequence[str]
+            sequence of detector names whose corresponding modules should set their
+            attribute override_grab_from_extension to True.
+        """
+        if overriden_grabbers is not None:
+            for mod_name in overriden_grabbers:
+                mod = self.modules_manager.get_mod_from_name(mod_name, 'det')
+                if mod is not None:
+                    mod.override_grab_from_extension = True
+
     def add_det_from_extension(self, name: str, daq_type: str, instrument_name: str,
                                instrument_controller: Any):
+
         """ Specific method to add a DAQ_Viewer within the Dashboard. This Particular detector
         should be defined in the plugin of the extension and is used to mimic a grab while data
         are actually coming from the extension which loaded it
 
         For an exemple, see the pymodaq_plugins_datamixer plugin and its DataMixer extension
+        or the DAQ_PID extension
 
         Parameters
         ----------
@@ -973,7 +1049,8 @@ class DashBoard(CustomApp):
 
     def update_module_manager(self):
         if self.modules_manager is None:
-            self.modules_manager = ModulesManager(self.detector_modules, self.actuators_modules)
+            self.modules_manager = ModulesManager(self.detector_modules, self.actuators_modules,
+                                                  parent_name='Dashboard')
         else:
             self.modules_manager.actuators_all = self.actuators_modules
             self.modules_manager.detectors_all = self.detector_modules
@@ -1014,17 +1091,20 @@ class DashBoard(CustomApp):
                         self.preset_manager.preset_params.child('Moves').children()]
             plugins += [{'type': 'det', 'value': child} for child in
                         self.preset_manager.preset_params.child('Detectors').children()]
-
             for plug in plugins:
-                if plug["type"] == 'det':
-                    plug['ID'] = plug['value']['params', 'detector_settings', 'controller_ID']
-                    plug['status'] = plug['value']['params', 'detector_settings',
-                        'controller_status']
-                else:
-                    plug['ID'] = plug['value']['params', 'move_settings',
-                        'multiaxes', 'controller_ID']
-                    plug['status'] = plug['value'][
-                            'params', 'move_settings', 'multiaxes', 'multi_status']
+                    if plug["type"] == 'det':
+                        try:
+                            plug['ID'] = plug['value']['params', 'detector_settings', 'controller_ID']
+                            plug['status'] = plug['value']['params', 'detector_settings', 'controller_status']
+                        except KeyError as e:
+                            raise DetectorError
+                    else:
+                        try:
+                            plug['ID'] = plug['value']['params', 'move_settings','multiaxes', 'controller_ID']
+                            plug['status'] = plug['value']['params', 'move_settings', 'multiaxes', 'multi_status']
+                        except KeyError as e:
+                            raise ActuatorError
+
 
 
             IDs = list(set([plug['ID'] for plug in plugins]))
@@ -1114,7 +1194,7 @@ class DashBoard(CustomApp):
                                 QtWidgets.QApplication.processEvents()
 
                         detector_modules[-1].settings.child('main_settings', 'overshoot').show()
-                        detector_modules[-1].overshoot_signal[bool].connect(self.stop_moves_from_overshoot)
+                        detector_modules[-1].overshoot_signal[bool].connect(self.stop_moves)
 
             QtWidgets.QApplication.processEvents()
             # restore dock state if saved
@@ -1402,8 +1482,11 @@ class DashBoard(CustomApp):
                 self.mainwindow.setVisible(True)
                 for area in self.dockarea.tempAreas:
                     area.window().setVisible(True)
-                messagebox(text=f'{str(error)}\nQuitting the application...',
-                           title='Incompatibility')
+                messagebox(severity='critical', title="Preset loading error",
+                         text=f"""
+                            <p>Saved preset file is not compatible anymore.</p>
+                            <p>Please recreate the preset at <b>{filename}</b>.</p>
+                 """)
                 logger.exception(str(error))
 
                 self.quit_fun()
@@ -1494,19 +1577,7 @@ class DashBoard(CustomApp):
                 QtWidgets.QApplication.processEvents()
             self.settings.child('detectors', name).setValue(det.initialized_state)
 
-    def do_stuff_from_out_bounds(self, out_of_bounds: bool):
-
-        if out_of_bounds:
-            logger.warning(f'Some actuators reached their bounds')
-            if self.scan_module is not None:
-                logger.warning(f'Stopping the DAQScan for out of bounds')
-                self.scan_module.stop_scan()
-
-    def stop_moves_from_overshoot(self, overshoot):
-        self.overshoot = overshoot
-        self.stop_moves()
-
-    def stop_moves(self, *args, **kwargs):
+    def stop_moves(self, overshoot):
         """
             Foreach module of the move module object list, stop motion.
 
@@ -1514,6 +1585,7 @@ class DashBoard(CustomApp):
             --------
             stop_scan,  DAQ_Move_main.daq_move.stop_motion
         """
+        self.overshoot = overshoot
         if self.scan_module is not None:
             self.scan_module.stop_scan()
 
@@ -1595,7 +1667,7 @@ class DashBoard(CustomApp):
             available_versions = [version_mod.parse(get_pypi_pymodaq(p)['version']) for p in packages]
             new_versions = np.greater(available_versions, current_versions)
             # Combine package and version information and select only the ones with a newer version available
-
+            
             
             packages_data = np.array(list(zip(packages, current_versions, available_versions)))[new_versions]
 
@@ -1606,27 +1678,43 @@ class DashBoard(CustomApp):
                 
                 vlayout = QtWidgets.QVBoxLayout()
 
-                message_label = QLabel("New versions of PyMoDAQ packages available!\nUse your package manager to update.")
+                message_label = QLabel("New versions of PyMoDAQ packages available!\nPlease select the ones you want to install:")
                 message_label.setAlignment(Qt.AlignCenter)
                 
 
                 table = PymodaqUpdateTableWidget()
                 table.setRowCount(len(packages_data)) 
-                table.setColumnCount(3)
-                table.setHorizontalHeaderLabels(["Package", "Current version", "New version"])
+                table.setColumnCount(4) 
+                table.setHorizontalHeaderLabels(["Select", "Package", "Current version", "New version"])
                      
                 for p in packages_data:
-                    table.append_row(p[0], p[1], p[2])
+                    table.append_row(QCheckBox(), p[0], p[1], p[2])
 
+                button = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+                button.accepted.connect(dialog.accept)
+                button.rejected.connect(dialog.reject) 
 
                 # The vlayout contains the message, the table and the buttons                
                 # and is connected to the dialog window
                 vlayout.addWidget(message_label)
                 vlayout.addWidget(table)
+                vlayout.addWidget(button)
                 dialog.setLayout(vlayout)
 
                 ret = dialog.exec()
 
+                if ret == QDialog.Accepted:
+                    # If the update is accepted, the checked packages are extracted from the table
+                    # and send to the updater
+                    packages_to_update = table.get_checked_data()
+                    if len(packages_to_update) > 0:
+                        packages_to_update_str = ', '.join(packages_to_update)
+                        logger.info("Trying to update:")
+                        logger.info(f"\t {packages_to_update_str}")
+                        subprocess.Popen(['pymodaq_updater', '--wait', '--file', __file__] + packages_to_update, stdin=subprocess.PIPE)
+                        self.quit_fun()
+                        return True
+                    logger.info("Update found but no packages checked for update.")
             else:
                 if show:
                     msgBox = QtWidgets.QMessageBox()

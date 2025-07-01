@@ -5,28 +5,31 @@ Created the 03/10/2022
 @author: Sebastien Weber
 """
 from random import randint
-from typing import Optional, Type
-
+from typing import Optional, Type, Union
 from easydict import EasyDict as edict
 
 from qtpy import QtCore
 from qtpy.QtCore import Signal, QObject, Qt, Slot, QThread
 
+from pymodaq.control_modules.thread_commands import ThreadStatus
 from pymodaq_utils.utils import ThreadCommand, find_dict_in_list_from_key_val
 from pymodaq_utils.config import Config
-from pymodaq_utils.enums import BaseEnum, enum_checker
+from pymodaq_utils.enums import BaseEnum
 from pymodaq_utils.logger import get_base_logger, set_logger, get_module_name
 
 from pymodaq_gui.utils.custom_app import CustomApp
 from pymodaq_gui.parameter import Parameter, ioxml
+from pymodaq_gui.parameter.utils import ParameterWithPath
 from pymodaq_gui.managers.parameter_manager import ParameterManager
 from pymodaq_gui.plotting.data_viewers import ViewersEnum
+from pymodaq_gui.h5modules.saving import H5Saver
 
 from pymodaq.utils.tcp_ip.tcp_server_client import TCPClient
 from pymodaq.utils.exceptions import DetectorError
 from pymodaq.utils.leco.pymodaq_listener import ActorListener, LECOClientCommands, LECOCommands
 
 from pymodaq.utils.daq_utils import get_plugins
+from pymodaq.utils.h5modules.module_saving import DetectorSaver, ActuatorSaver
 
 
 class DAQTypesEnum(BaseEnum):
@@ -130,11 +133,50 @@ class ControlModule(QObject):
         self._send_to_tcpip = False
         self._tcpclient_thread = None
         self._hardware_thread = None
-        self.module_and_data_saver = None
+
         self.plugin_config: Optional[Config] = None
+
+        self._h5saver: Optional[H5Saver] = None
+        self._module_and_data_saver = None
 
     def __repr__(self):
         return f'{self.__class__.__name__}: {self.title}'
+
+    def create_new_file(self, new_file: bool):
+        if new_file:
+            self.close_file()
+
+        self.module_and_data_saver.h5saver = self.h5saver
+        return True
+
+    @property
+    def h5saver(self):
+        if self._h5saver is None:
+            self._h5saver = H5Saver(backend=config('general', 'hdf5_backend'))
+        if self._h5saver.h5_file is None:
+            self._h5saver.init_file(update_h5=True)
+        if not self._h5saver.isopen():
+            self._h5saver.init_file(addhoc_file_path=self._h5saver.settings['current_h5_file'])
+        return self._h5saver
+
+    @h5saver.setter
+    def h5saver(self, h5saver_temp: H5Saver):
+        self._h5saver = h5saver_temp
+
+    def close_file(self):
+        self.h5saver.close_file()
+
+    @property
+    def module_and_data_saver(self):
+        if not self._module_and_data_saver.h5saver.isopen():
+            self._module_and_data_saver.h5saver = self.h5saver
+        return self._module_and_data_saver
+
+    @module_and_data_saver.setter
+    def module_and_data_saver(self, mod: Union[DetectorSaver, ActuatorSaver]):
+        self._module_and_data_saver = mod
+        self._module_and_data_saver.h5saver = self.h5saver
+
 
     def custom_command(self, command: str, **kwargs):
         self.command_hardware.emit(ThreadCommand(command, kwargs))
@@ -166,20 +208,17 @@ class ControlModule(QObject):
             else:
                 self.update_status(status.attribute[0])
 
-        elif status.command == 'update_status':
+        elif status.command == ThreadStatus.UPDATE_STATUS:
             self.update_status(status.attribute)
 
-        elif status.command == "close":
+        elif status.command == ThreadStatus.CLOSE:
             try:
                 self.update_status(status.attribute[0])
                 self._hardware_thread.quit()
-                self._hardware_thread.wait()
-                finished = self._hardware_thread.isFinished()
-                if finished:
-                    pass
-                else:
-                    print('Thread still running')
+                terminated = self._hardware_thread.wait(5000)
+                if not terminated:
                     self._hardware_thread.terminate()
+                    self._hardware_thread.wait()
                     self.update_status('thread is locked?!', 'log')
             except Exception as e:
                 logger.exception(f'Wrong call to the "close" command: \n{str(e)}')
@@ -187,7 +226,7 @@ class ControlModule(QObject):
             self._initialized_state = False
             self.init_signal.emit(self._initialized_state)
 
-        elif status.command == 'update_main_settings':
+        elif status.command == ThreadStatus.UPDATE_MAIN_SETTINGS:
             # this is a way for the plugins to update main settings of the ui (solely values, limits and options)
             try:
                 if status.attribute[2] == 'value':
@@ -199,7 +238,7 @@ class ControlModule(QObject):
             except Exception as e:
                 logger.exception(f'Wrong call to the "update_main_settings" command: \n{str(e)}')
 
-        elif status.command == 'update_settings':
+        elif status.command == ThreadStatus.UPDATE_SETTINGS:
             # using this the settings shown in the UI for the plugin reflects the real plugin settings
             try:
                 self.settings.sigTreeStateChanged.disconnect(
@@ -227,7 +266,7 @@ class ControlModule(QObject):
                 logger.exception(f'Wrong call to the "update_settings" command: \n{str(e)}')
             self.settings.sigTreeStateChanged.connect(self.parameter_tree_changed)
 
-        elif status.command == 'update_ui':
+        elif status.command == ThreadStatus.UPDATE_UI:
             try:
                 if self.ui is not None:
                     if hasattr(self.ui, status.attribute):
@@ -236,16 +275,16 @@ class ControlModule(QObject):
             except Exception as e:
                 logger.info(f'Wrong call to the "update_ui" command: \n{str(e)}')
 
-        elif status.command == 'raise_timeout':
+        elif status.command == ThreadStatus.RAISE_TIMEOUT:
             self.raise_timeout()
 
-        elif status.command == 'show_splash':
+        elif status.command == ThreadStatus.SHOW_SPLASH:
             self.settings_tree.setEnabled(False)
             self.splash_sc.show()
             self.splash_sc.raise_()
             self.splash_sc.showMessage(status.attribute, color=Qt.white)
 
-        elif status.command == 'close_splash':
+        elif status.command == ThreadStatus.CLOSE_SPLASH:
             self.splash_sc.close()
             self.settings_tree.setEnabled(True)
 
@@ -330,7 +369,7 @@ class ControlModule(QObject):
 
             return Config()
 
-    def update_status(self, txt, log=True):
+    def update_status(self, txt: str, log=True):
         """Display a message in the ui status bar and eventually log the message
 
         Parameters
@@ -431,7 +470,9 @@ class ParameterControlModule(ParameterManager, ControlModule):
                 if self.settings.child('main_settings', 'tcpip', 'tcp_connected').value():
                     self._command_tcpip.emit(ThreadCommand('send_info', dict(path=path, param=param)))
                 if self.settings.child('main_settings', 'leco', 'leco_connected').value():
-                    self._command_tcpip.emit(ThreadCommand('send_info', dict(path=path, param=param)))
+                    self._command_tcpip.emit(
+                        ThreadCommand(LECOCommands.SEND_INFO,
+                                      ParameterWithPath(param, path)))
 
     def connect_tcp_ip(self, params_state=None, client_type: str = "GRABBER") -> None:
         """Init a TCPClient in a separated thread to communicate with a distant TCp/IP Server
@@ -478,7 +519,7 @@ class ParameterControlModule(ParameterManager, ControlModule):
         if port == '':
             # take the default port as 12300
             port = 12300
-        return (host, port)    
+        return (host, port)
 
     def connect_leco(self, connect: bool) -> None:
         if connect:
@@ -515,6 +556,33 @@ class ParameterControlModule(ParameterManager, ControlModule):
 
         elif status.command == 'Update_Status':
             self.thread_status(status)
+
+        elif status.command == 'set_info':
+            """ The Director sent a parameter to be updated"""
+            path_in_settings = status.attribute.path
+            if 'move' in self.__class__.__name__.lower():
+                common_param = 'move_settings'
+            else:
+                common_param = 'detector_settings'
+            if common_param in path_in_settings:
+                param = self.settings.child(*path_in_settings)
+            elif 'settings_client' in path_in_settings:
+                param = self.settings.child(common_param, *path_in_settings[1:])
+            else:
+                param = self.settings.child(common_param, *path_in_settings)
+
+            param.setValue(status.attribute.parameter.value())
+
+        elif status.command == LECOCommands.GET_SETTINGS:
+            """ The Director requested the content of the actuator settings"""
+            if 'move' in self.__class__.__name__.lower():
+                common_param = 'move_settings'
+            else:
+                common_param = 'detector_settings'
+            self._command_tcpip.emit(
+                ThreadCommand(LECOCommands.SET_SETTINGS,
+                              ioxml.parameter_to_xml_string(
+                                  self.settings.child(common_param))))
 
         else:
             # not handled

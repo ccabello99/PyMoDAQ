@@ -10,6 +10,7 @@ import numpy as np
 from qtpy import QtWidgets
 from qtpy.QtCore import QObject, Slot, Signal, QTimer
 
+
 from pymodaq_utils.utils import ThreadCommand, find_keys_from_val
 from pymodaq_utils import config as configmod
 from pymodaq_utils.warnings import deprecation_msg
@@ -33,6 +34,8 @@ from pymodaq_utils.serialize.mysocket import Socket
 from pymodaq_utils.serialize.serializer_legacy import DeSerializer, Serializer
 from pymodaq import Unit
 from pint.errors import OffsetUnitCalculusError
+
+from pymodaq.control_modules.thread_commands import ThreadStatus, ThreadStatusMove
 
 if TYPE_CHECKING:
     from pymodaq.control_modules.daq_move import DAQ_Move_Hardware
@@ -281,7 +284,8 @@ class DAQ_Move_base(QObject):
     data_shape = (1, )  # expected shape of the underlying actuator's value (in general a float so shape = (1, ))
 
     def __init__(self, parent: Optional['DAQ_Move_Hardware'] = None,
-                 params_state: Optional[dict] = None):
+                 params_state: Optional[dict] = None,
+                 **kwargs):
         QObject.__init__(self)  # to make sure this is the parent class
         self.move_is_done = False
         self.parent = parent
@@ -341,7 +345,7 @@ class DAQ_Move_base(QObject):
     def axis_unit(self, unit: str):
         self.axis_units[self.axis_index_key] = unit
         self.settings.child('units').setValue(unit)
-        self.emit_status(ThreadCommand('units', unit))
+        self.emit_status(ThreadCommand(ThreadStatusMove.UNITS, unit))
 
     @property
     def axis_units(self) -> Union[List[str], Dict[str, str]]:
@@ -607,21 +611,10 @@ class DAQ_Move_base(QObject):
         Return the new position eventually coerced within the bounds
         """
         if self.settings['bounds', 'is_bounds']:
-            if self.data_actuator_type == DataActuatorType.DataActuator:
-                for data_array in position:
-                    if np.any(data_array > self.settings['bounds', 'max_bound']) or \
-                            np.any(data_array < self.settings['bounds', 'min_bound']):
-                        self.emit_status(ThreadCommand('outofbounds'))
-                    data_array[data_array > self.settings['bounds', 'max_bound']] = self.settings['bounds', 'max_bound']
-                    data_array[data_array < self.settings['bounds', 'min_bound']] = self.settings['bounds', 'min_bound']
-
-            else:
-                if position > self.settings['bounds', 'max_bound']:
-                    self.emit_status(ThreadCommand('outofbounds'))
-                    position = self.settings['bounds', 'max_bound']
-                elif position < self.settings['bounds', 'min_bound']:
-                    self.emit_status(ThreadCommand('outofbounds'))
-                    position = self.settings['bounds', 'min_bound']
+            for data_array in position:
+                data_array[data_array > self.settings['bounds', 'max_bound']] = self.settings['bounds', 'max_bound']
+                data_array[data_array < self.settings['bounds', 'min_bound']] = self.settings['bounds', 'min_bound']
+            self.emit_status(ThreadCommand(ThreadStatusMove.OUT_OF_BOUNDS, []))
         return position
 
     def get_actuator_value(self):
@@ -668,7 +661,7 @@ class DAQ_Move_base(QObject):
     def emit_value(self, pos: DataActuator):
         """Convenience method to emit the current actuator value back to the UI"""
 
-        self.emit_status(ThreadCommand('get_actuator_value', [pos]))
+        self.emit_status(ThreadCommand(ThreadStatusMove.GET_ACTUATOR_VALUE, pos))
 
     def commit_settings(self, param: Parameter):
         """
@@ -697,7 +690,7 @@ class DAQ_Move_base(QObject):
                 position = self.get_actuator_value()
         if position.name != self._title:  # make sure the emitted DataActuator has the name of the real implementation
             #of the plugin
-            position = DataActuator(self._title, data=position.value(self.axis_unit),
+            position = DataActuator(self._title, data=position.value(),
                                     units=self.axis_unit)
         self.move_done_signal.emit(position)
         self.move_is_done = True
@@ -709,7 +702,8 @@ class DAQ_Move_base(QObject):
         --------
         DAQ_utils.ThreadCommand, move_done
         """
-        if 'TCPServer' not in self.__class__.__name__:
+        if not ('TCPServer' in self.__class__.__name__ or
+                'LECODirector' in self.__class__.__name__):
             self.start_time = perf_counter()
             if self.ispolling:
                 self.poll_timer.start()
@@ -779,7 +773,7 @@ class DAQ_Move_base(QObject):
 
             logger.debug(f'Check move_is_done: {self.move_is_done}')
             if self.move_is_done:
-                self.emit_status(ThreadCommand('Move has been stopped', ))
+                self.emit_status(ThreadCommand(ThreadStatus.UPDATE_STATUS, 'Move has been stopped', ))
                 logger.info('Move has been stopped')
             self.current_value = self.get_actuator_value()
             self.emit_value(self._current_value)
@@ -787,7 +781,7 @@ class DAQ_Move_base(QObject):
 
             if perf_counter() - self.start_time >= self.settings['timeout']:
                 self.poll_timer.stop()
-                self.emit_status(ThreadCommand('raise_timeout', ))
+                self.emit_status(ThreadCommand(ThreadStatus.RAISE_TIMEOUT, ))
                 logger.info('Timeout activated')
         else:
             self.poll_timer.stop()
@@ -804,37 +798,32 @@ class DAQ_Move_base(QObject):
         for param, change, data in changes:
             path = self.settings.childPath(param)
             if change == 'childAdded':
-                self.emit_status(ThreadCommand('update_settings',
+                self.emit_status(ThreadCommand(ThreadStatus.UPDATE_SETTINGS,
                                                [self.parent_parameters_path + path, [data[0].saveState(), data[1]],
                                                 change]))  # send parameters values/limits back to the GUI. Send kind of a copy back the GUI otherwise the child reference will be the same in both th eUI and the plugin so one of them will be removed
             elif change == 'value' or change == 'limits' or change == 'options':
-                self.emit_status(ThreadCommand('update_settings', [self.parent_parameters_path + path, data,
-                                                                   change]))  # send parameters values/limits back to the GUI
+                self.emit_status(ThreadCommand(ThreadStatus.UPDATE_SETTINGS,
+                                               [self.parent_parameters_path + path, data,
+                                                change]))  # send parameters values/limits back to the GUI
             elif change == 'parent':
                 pass
             elif change == 'limits':
-                self.emit_status(ThreadCommand('update_settings', [self.parent_parameters_path + path, data,
-                                                                   change]))
+                self.emit_status(ThreadCommand(ThreadStatus.UPDATE_SETTINGS,
+                                               [self.parent_parameters_path + path, data,
+                                                change]))
 
     def get_position_with_scaling(self, pos: DataActuator) -> DataActuator:
         """ Get the current position from the hardware with scaling conversion.
         """
         if self.settings['scaling', 'use_scaling']:
-            if self.data_actuator_type == DataActuatorType.float:
-                pos = (pos - self.settings['scaling', 'offset']) * self.settings['scaling', 'scaling']
-            else:
-                pos = (pos - Q_(self.settings['scaling', 'offset'],
-                                self.axis_unit)) * self.settings['scaling', 'scaling']
+            pos = (pos - self.settings['scaling', 'offset']) * self.settings['scaling', 'scaling']
         return pos
 
     def set_position_with_scaling(self, pos: DataActuator) -> DataActuator:
         """ Set the current position from the parameter and hardware with scaling conversion.
         """
         if self.settings['scaling', 'use_scaling']:
-            if self.data_actuator_type == DataActuatorType.DataActuator:
-                pos = pos / self.settings['scaling', 'scaling'] + Q_(self.settings['scaling', 'offset'], self.axis_unit)
-            else:
-                pos = pos / self.settings['scaling', 'scaling'] + self.settings['scaling', 'offset']
+            pos = pos / self.settings['scaling', 'scaling'] + self.settings['scaling', 'offset']
         return pos
 
     def set_position_relative_with_scaling(self, pos: DataActuator) -> DataActuator:
@@ -868,12 +857,14 @@ class DAQ_Move_base(QObject):
             except ValueError:
                 apply_settings = False
         elif change == 'parent':
-            children = putils.get_param_from_name(self.settings, param.name())
+            try:
+                children = putils.get_param_from_name(self.settings, param.name())
 
-            if children is not None:
-                path = putils.get_param_path(children)
-                self.settings.child(*path[1:-1]).removeChild(children)
-
+                if children is not None:
+                    path = putils.get_param_path(children)
+                    self.settings.child(*path[1:-1]).removeChild(children)
+            except IndexError:
+                logger.debug(f'Could not remove children from {param.name()}')
         self.settings.sigTreeStateChanged.connect(self.send_param_status)
         if apply_settings:
             self.commit_common_settings(param)
@@ -933,13 +924,13 @@ class DAQ_Move_TCP_server(DAQ_Move_base, TCPServer):
 
                 pos = self.get_position_with_scaling(pos)
                 self._current_value = pos
-                self.emit_status(ThreadCommand('get_actuator_value', pos))
+                self.emit_status(ThreadCommand(ThreadStatusMove.GET_ACTUATOR_VALUE, pos))
 
             elif command == 'move_done':
                 pos = DeSerializer(sock).dwa_deserialization()
                 pos = self.get_position_with_scaling(pos)
                 self._current_value = pos
-                self.emit_status(ThreadCommand('move_done', pos))
+                self.emit_status(ThreadCommand(ThreadStatusMove.MOVE_DONE, pos))
             else:
                 self.send_command(sock, command)
 

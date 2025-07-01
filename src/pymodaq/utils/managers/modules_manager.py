@@ -1,4 +1,4 @@
-from typing import List, Union, TYPE_CHECKING
+from typing import List, Union, TYPE_CHECKING, Optional, Sequence
 
 from collections import OrderedDict
 from qtpy.QtCore import QObject, Signal, Slot, QThread
@@ -68,9 +68,26 @@ class ModulesManager(QObject, ParameterManager):
         ]},
     ]
 
-    def __init__(self, detectors=[], actuators=[], selected_detectors=[], selected_actuators=[], **kwargs):
+    def __init__(self,
+                 detectors: Optional[Sequence['DAQ_Viewer']] = None,
+                 actuators: Optional[Sequence['DAQ_Move']] = None,
+                 selected_detectors: Optional[Sequence['DAQ_Viewer']] = None,
+                 selected_actuators: Optional[Sequence['DAQ_Move']] = None,
+                 parent_name='',
+                 **kwargs):
+
         QObject.__init__(self)
         ParameterManager.__init__(self)
+        if detectors is None:
+            detectors = []
+        if actuators is None:
+            actuators = []
+        if selected_detectors is None:
+            selected_detectors = []
+        if selected_actuators is None:
+            selected_actuators = []
+
+        self.parent_name = parent_name
 
         for mod in selected_actuators:
             assert mod in actuators
@@ -99,6 +116,9 @@ class ModulesManager(QObject, ParameterManager):
 
         self.set_actuators(actuators, selected_actuators)
         self.set_detectors(detectors, selected_detectors)
+
+    def __repr__(self):
+        return f'ModulesManager of "{self.parent_name}" with control modules: {self.get_names(self.modules_all)}'
 
     def show_only_control_modules(self, show: True):
         self.settings.child('move_done').show(not show)
@@ -197,7 +217,7 @@ class ModulesManager(QObject, ParameterManager):
 
     @property
     def modules(self):
-        """Get the list of all detectors and actuators"""
+        """Get the list of detectors and actuators"""
         return self.detectors + self.actuators
 
     @property
@@ -287,8 +307,15 @@ class ModulesManager(QObject, ParameterManager):
         """
         return self.settings.child('data_dimensions', f'det_data_list{dim.upper()}').value()['selected']
 
-    def grab_data(self, **kwargs):
-        """Do a single grab of connected and selected detectors"""
+    def grab_data(self, check_do_override=True, **kwargs):
+        """Do a single grab of connected and selected detectors
+
+        Parameter
+        ---------
+        check_do_override: bool
+            If this is True the signal emission to the DAQ_Viewers will be conditionned to the status of their internal
+            override_grab_from_extension attribute
+        """
         self.det_done_datas = DataToExport(name=__class__.__name__, control_module='DAQ_Viewer')
         self._received_data = 0
         self.det_done_flag = False
@@ -296,8 +323,9 @@ class ModulesManager(QObject, ParameterManager):
         tzero = time.perf_counter()
 
         for mod in self.detectors:
-            kwargs.update(dict(Naverage=mod.Naverage))
-            mod.command_hardware.emit(utils.ThreadCommand("single", kwargs))
+            if not (check_do_override and mod.override_grab_from_extension):
+                kwargs.update(dict(Naverage=mod.Naverage))
+                mod.command_hardware.emit(utils.ThreadCommand("single", kwargs))
 
         while not self.det_done_flag:
             # wait for grab done signals to end
@@ -307,6 +335,7 @@ class ModulesManager(QObject, ParameterManager):
                 self.timeout_signal.emit(True)
                 logger.error('Timeout Fired during waiting for data to be acquired')
                 break
+            QThread.msleep(10)
 
         self.det_done_signal.emit(self.det_done_datas)
         return self.det_done_datas
@@ -458,7 +487,7 @@ class ModulesManager(QObject, ParameterManager):
                     self.timeout_signal.emit(True)
                     logger.error('Timeout Fired during waiting for actuators to be moved')
                     break
-                QThread.msleep(20)
+                QThread.msleep(10)
 
         self.move_done_signal.emit(self.move_done_positions)
         return self.move_done_positions

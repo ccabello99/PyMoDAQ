@@ -146,7 +146,7 @@ class DAQScan(QObject, ParameterManager):
         self.curvilinear_values = []
         self.plot_colors = utils.plot_colors
 
-        self.scan_thread: QThread = None
+        self.runner_thread: QThread = None
         self._h5saver: H5Saver = None
         self._module_and_data_saver: module_saving.ScanSaver = None
 
@@ -880,6 +880,13 @@ class DAQScan(QObject, ParameterManager):
         self._metada_dataset_set = True
         return res
 
+    def exit_runner_thread(self, duration : int = 5000):
+        self.runner_thread.quit()
+        terminated = self.runner_thread.wait(duration)
+        if not terminated:
+            self.runner_thread.terminate()
+            self.runner_thread.wait()
+
     def start_scan(self):
         """
             Start an acquisition calling the set_scan function.
@@ -919,27 +926,24 @@ class DAQScan(QObject, ParameterManager):
             self.module_and_data_saver.h5saver = self.h5saver  # force the update as the h5saver ill also be set on each detectors
 
             # mandatory to deal with multithreads
-            if self.scan_thread is not None:
+            if self.runner_thread is not None:
                 self.command_daq_signal.disconnect()
-                if self.scan_thread.isRunning():
-                    self.scan_thread.terminate()
-                    while not self.scan_thread.isFinished():
-                        QThread.msleep(100)
-                    self.scan_thread = None
+                self.exit_runner_thread()
+                self.runner_thread = None
 
-            self.scan_thread = QThread()
+            self.runner_thread = QThread()
 
             scan_acquisition = DAQScanAcquisition(self.settings, self.scanner, self.modules_manager,
                                                   )
 
             if config['scan']['scan_in_thread']:
-                scan_acquisition.moveToThread(self.scan_thread)
+                scan_acquisition.moveToThread(self.runner_thread)
             self.command_daq_signal[utils.ThreadCommand].connect(scan_acquisition.queue_command)
             scan_acquisition.scan_data_tmp[ScanDataTemp].connect(self.save_temp_live_data)
             scan_acquisition.status_sig[utils.ThreadCommand].connect(self.thread_status)
 
-            self.scan_thread.scan_acquisition = scan_acquisition
-            self.scan_thread.start()
+            self.runner_thread.scan_acquisition = scan_acquisition
+            self.runner_thread.start()
 
             self.ui.set_action_enabled('ini_positions', False)
             self.ui.set_action_enabled('start', False)
@@ -992,7 +996,8 @@ class DAQScan(QObject, ParameterManager):
         self.ui.set_permanent_status('Stoping acquisition')
         self.command_daq_signal.emit(utils.ThreadCommand("stop_acquisition"))
         scan_node = self.module_and_data_saver.get_last_node()
-        scan_node.attrs['scan_done'] = True
+        if scan_node is not None:
+            scan_node.attrs['scan_done'] = True
 
         if not self.dashboard.overshoot:
             self.set_ini_positions()  # do not set ini position again in case overshoot fired
@@ -1095,7 +1100,6 @@ class DAQScanAcquisition(QObject):
 
     def start_acquisition(self):
         try:
-            #todo hoaw to apply newlayout to adaptive mode? => cannot has to be a new extension
 
             self.modules_manager.connect_actuators()
             self.modules_manager.connect_detectors()
@@ -1120,20 +1124,6 @@ class DAQScanAcquisition(QObject):
                         positions = self.scanner.positions_at(self.ind_scan)  # get positions
                     else:
                         pass
-                        #todo update for v4
-                        # positions = learner.ask(1)[0][-1]  # next point to probe
-                        # if self.scanner.scan_type == 'Tabular':  # translate normalized curvilinear position to real coordinates
-                        #     self.curvilinear = positions
-                        #     length = 0.
-                        #     for v in self.scanner.vectors:
-                        #         length += v.norm()
-                        #         if length >= self.curvilinear:
-                        #             vec = v
-                        #             frac_curvilinear = (self.curvilinear - (length - v.norm())) / v.norm()
-                        #             break
-                        #
-                        #     position = (vec.vectorize() * frac_curvilinear).translate_to(vec.p1()).p2()
-                        #     positions = [position.x(), position.y()]
 
                     self.status_sig.emit(
                         utils.ThreadCommand("Update_scan_index",
@@ -1148,21 +1138,7 @@ class DAQScanAcquisition(QObject):
                     QThread.msleep(self.scan_settings['time_flow', 'wait_time_between'])
 
                     #grab datas and wait for grab completion
-                    self.det_done(self.modules_manager.grab_datas(positions=positions), positions)
-
-                    if self.isadaptive:
-                        #todo update for v4
-                        # det_channel = self.modules_manager.get_selected_probed_data()
-                        # det, channel = det_channel[0].split('/')
-                        # if self.scanner.scan_type == 'Tabular':
-                        #     self.curvilinear_array.append(np.array([self.curvilinear]))
-                        #     new_positions = self.curvilinear
-                        # elif self.scanner.scan_type == 'Scan1D':
-                        #     new_positions = positions[0]
-                        # else:
-                        #     new_positions = positions[:]
-                        # learner.tell(new_positions, self.modules_manager.det_done_datas[det]['data0D'][channel]['data'])
-                        pass
+                    self.det_done(self.modules_manager.grab_data(positions=positions), positions)
 
                     # daq_scan wait time
                     QThread.msleep(self.scan_settings.child('time_flow', 'wait_time').value())
@@ -1200,11 +1176,6 @@ class DAQScanAcquisition(QObject):
             self.status_sig.emit(
                 utils.ThreadCommand("add_data",
                                     dict(indexes=indexes, distribution=self.scanner.distribution)))
-
-            #todo related to adaptive (solution lies along the Enlargeable data saver)
-            if self.isadaptive:
-                for ind_ax, nav_axis in enumerate(self.navigation_axes):
-                    nav_axis.append(np.array(positions[ind_ax]))
 
             self.det_done_flag = True
 

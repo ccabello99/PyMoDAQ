@@ -1,17 +1,20 @@
 from __future__ import annotations
 from typing import Optional, Union
 
-from easydict import EasyDict as edict
-
 from pymodaq.control_modules.viewer_utility_classes import DAQ_Viewer_base, comon_parameters, main
-
-from pymodaq_utils.utils import ThreadCommand, getLineInfo
+from pymodaq.utils.data import DataFromPlugins, Axis
+from pymodaq_data import DataToExport
+from pymodaq_utils.serialize.factory import SerializableFactory
 
 from pymodaq_gui.parameter import Parameter
-from pymodaq_utils.serialize.serializer_legacy import DeSerializer
 
 from pymodaq.utils.leco.leco_director import LECODirector, leco_parameters
 from pymodaq.utils.leco.director_utils import DetectorDirector
+from pymodaq_utils.logger import set_logger, get_module_name
+
+import numpy as np
+
+logger = set_logger(get_module_name(__file__))
 
 
 class DAQ_xDViewer_LECODirector(LECODirector, DAQ_Viewer_base):
@@ -25,21 +28,16 @@ class DAQ_xDViewer_LECODirector(LECODirector, DAQ_Viewer_base):
 
     params_GRABBER = []
 
-    message_list = LECODirector.message_list + ["Quit", "Send Data 0D", "Send Data 1D",
-                                                "Send Data 2D", "Send Data ND",
-                                                "Status", "Done", "Server Closed",
-                                                "Info", "Infos", "Info_xml", 'x_axis', 'y_axis']
     socket_types = ["GRABBER"]
     params = comon_parameters + leco_parameters
+    live_mode_available = True
 
     def __init__(self, parent=None, params_state=None, grabber_type: str = "0D", **kwargs) -> None:
-        super().__init__(parent=parent, params_state=params_state, **kwargs)
-        self.register_rpc_methods((
-            self.set_x_axis,
-            self.set_y_axis,
-        ))
+        DAQ_Viewer_base.__init__(self, parent=parent,
+                                 params_state=params_state)
+        LECODirector.__init__(self, host=self.settings['host'])
         for method in (
-            self.set_data,
+                self.set_data,
         ):
             self.listener.register_binary_rpc_method(method, accept_binary_input=True)
 
@@ -62,54 +60,23 @@ class DAQ_xDViewer_LECODirector(LECODirector, DAQ_Viewer_base):
             --------
             utility_classes.DAQ_TCP_server.init_server, get_xaxis, get_yaxis
         """
-        self.status.update(edict(initialized=False, info="", x_axis=None, y_axis=None,
-                                 controller=None))
-        actor_name = self.settings.child("actor_name").value()
-        self.controller = self.ini_detector_init(  # type: ignore
-            old_controller=controller,
-            new_controller=DetectorDirector(actor=actor_name, communicator=self.communicator),
-            )
-        self.controller.set_remote_name(self.communicator.full_name)  # type: ignore
-        try:
-            # self.settings.child(('infos')).addChildren(self.params_GRABBER)
 
-            # init axes from image , here returns only None values (to tricky to di it with the
-            # server and not really necessary for images anyway)
-            self.x_axis = self.get_xaxis()
-            self.y_axis = self.get_yaxis()
-            self.status.x_axis = self.x_axis
-            self.status.y_axis = self.y_axis
-            self.status.initialized = True
-            return self.status
+        actor_name = self.settings["actor_name"]
+        if self.is_master:
+            self.controller = DetectorDirector(actor=actor_name,
+                                               communicator=self.communicator)
+            try:
+                self.controller.set_remote_name(self.communicator.full_name)  # type: ignore
+            except TimeoutError:
+                logger.warning("Timeout setting remote name.")
+        else:
+            self.controller = controller
 
-        except Exception as e:
-            self.status.info = getLineInfo() + str(e)
-            self.status.initialized = False
-            return self.status
+        self.controller.get_settings()
 
-    def get_xaxis(self):
-        """
-            Obtain the horizontal axis of the image.
-
-            Returns
-            -------
-            1D numpy array
-                Contains a vector of integer corresponding to the horizontal camera pixels.
-        """
-        pass
-        return self.x_axis
-
-    def get_yaxis(self):
-        """
-            Obtain the vertical axis of the image.
-
-            Returns
-            -------
-            1D numpy array
-                Contains a vector of integer corresponding to the vertical camera pixels.
-        """
-        pass
-        return self.y_axis
+        initialized = True
+        info = 'Viewer Director ready'
+        return info, initialized
 
     def grab_data(self, Naverage=1, **kwargs):
         """
@@ -126,35 +93,23 @@ class DAQ_xDViewer_LECODirector(LECODirector, DAQ_Viewer_base):
             --------
             utility_classes.DAQ_TCP_server.process_cmds
         """
-        try:
-            self.ind_grabbed = 0  # to keep track of the current image in the average
-            self.Naverage = Naverage
-            self.controller.set_remote_name(self.communicator.full_name)
-            self.controller.send_data(grabber_type=self.grabber_type)
 
-        except Exception as e:
-            self.emit_status(ThreadCommand('Update_Status', [getLineInfo() + str(e), "log"]))
+        self.ind_grabbed = 0  # to keep track of the current image in the average
+        self.Naverage = Naverage
+        self.controller.set_remote_name(self.communicator.full_name)
+        if kwargs.get('live', False):
+            self.controller.send_data_grab()
+        else:
+            self.controller.send_data_snap()
 
     def stop(self):
         """
             not implemented.
         """
-        pass
-        return ""
+        self.controller.stop_grab()
 
-    # Methods for RPC calls
-    def set_x_axis(self, data, label: str = "", units: str = ""):
-        # TODO make to work
-        self.x_axis = dict(data=data, label=label, units=units)
-        self.emit_x_axis()
-
-    def set_y_axis(self, data, label: str = "", units: str = ""):
-        # TODO make to work
-        self.y_axis = dict(data=data, label=label, units=units)
-        self.emit_y_axis()
-
-    def set_data(self, data: Union[list, str, None],
-                 additional_payload: Optional[list[bytes]]=None) -> None:
+    def set_data(self, data: Union[dict,list, str, float, None],
+                 additional_payload: Optional[list[bytes]] = None) -> None:
         """
         Set the grabbed data signal.
 
@@ -162,15 +117,34 @@ class DAQ_xDViewer_LECODirector(LECODirector, DAQ_Viewer_base):
 
         :param data: If None, look for the additional object
         """
-        if isinstance(data, str):
-            deserializer = DeSerializer.from_b64_string(data)
-        elif additional_payload is not None:
-            deserializer = DeSerializer(additional_payload[0])
+        if additional_payload:
+            dte = SerializableFactory().get_apply_deserializer(additional_payload[0])
+        elif data is not None:
+            axes = []
+            labels = []
+            if isinstance(data, dict):
+                axes = [
+                    Axis( label=axis.get('label', ''),
+                          units=axis.get('units', ''),
+                          data=np.array(axis.get('data', [])),
+                          index=ind
+                    ) for ind, axis in enumerate(data.get('axes', []))
+                ]
+                labels = data.get('labels', [])
+                data = data.get('data', [])
+
+            np_data = np.atleast_1d(data)
+            if np_data.ndim <= 2:
+                data = [np_data]
+            else:
+                data = [np.atleast_1d(d) for d in data]
+
+            dfp = DataFromPlugins(self.controller.actor, data=data, axes=axes[:data[0].ndim], labels=labels)
+            dte = DataToExport('Copy', data=[dfp])
         else:
-            raise NotImplementedError("Not implemented to set a list of values.")
-        dte = deserializer.dte_deserialization()
+            raise ValueError("Can't set_data when data is None")
         self.dte_signal.emit(dte)
 
 
 if __name__ == '__main__':
-    main(__file__)
+    main(__file__, init=False)
